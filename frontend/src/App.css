@@ -75,6 +75,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .auth-submit { width: 100%; height: 46px; display: flex; align-items: center; justify-content: space-between; margin-top: 24px; padding: 0 14px; font-size: 13px; }
 .auth-switch { margin-top: 21px; text-align: center; font-size: 12px !important; }
 .auth-switch button { padding: 0; border: 0; background: none; color: var(--accent-dark); font-weight: 700; cursor: pointer; }
+.guest-button { width: 100%; justify-content: center; gap: 8px; margin-top: 16px; }
+.guest-note { margin: 8px 0 0; color: var(--muted); text-align: center; font-size: 10px !important; line-height: 1.6; }
+.inline-notice { margin-top: 15px; padding: 10px 12px; border-radius: 7px; color: var(--green); background: rgba(77,145,111,.1); font-size: 12px; line-height: 1.5; }
 .privacy-note { display: flex; justify-content: center; align-items: center; gap: 7px; margin-top: 45px; color: var(--muted); font-size: 10px; }
 .inline-error { margin-top: 15px; padding: 10px 12px; border-radius: 7px; color: var(--red); background: rgba(195,96,77,.1); font-size: 12px; }
 
@@ -105,7 +108,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .conversation-link { flex: 1; min-width: 0; height: 33px; overflow: hidden; border: 0; background: transparent; text-align: left; padding: 0 9px; cursor: pointer; }
 .conversation-title { display: block; overflow: hidden; color: #77756f; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-row.selected .conversation-title { color: var(--ink); font-weight: 600; }
-.conversation-delete { display: none; width: 26px; height: 26px; }
+.conversation-delete, .conversation-rename { display: none; width: 26px; height: 26px; }
+.conversation-row:hover .conversation-delete, .conversation-row:hover .conversation-rename,
+.conversation-row:focus-within .conversation-delete, .conversation-row:focus-within .conversation-rename { display: grid; }
+.conversation-rename-form { display: flex; width: 100%; align-items: center; gap: 2px; }
+.conversation-rename-form input { width: 100%; min-width: 0; height: 28px; border: 1px solid var(--accent); border-radius: 5px; background: var(--canvas); color: var(--ink); padding: 0 6px; font-size: 10px; }
+.conversation-rename-form .icon-button { width: 25px; height: 25px; }
 .conversation-row:hover .conversation-delete { display: grid; }
 .side-empty { padding: 4px 7px; color: #aaa79f; font-size: 10px; }
 .sidebar-bottom { margin-top: auto; }

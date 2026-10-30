@@ -1,8 +1,12 @@
 import json
+import logging
+import smtplib
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from typing import Annotated
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -13,7 +17,14 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.database.session import get_db
-from app.models.entities import Conversation, Message, User, UserSession, utc_now
+from app.models.entities import (
+    Conversation,
+    Message,
+    PasswordResetToken,
+    User,
+    UserSession,
+    utc_now,
+)
 from app.schemas.api import (
     ChatRequest,
     ConversationCreate,
@@ -21,6 +32,8 @@ from app.schemas.api import (
     ConversationRename,
     Credentials,
     MessageOut,
+    PasswordResetConfirm,
+    PasswordResetRequest,
     UserOut,
 )
 from app.services.security import (
@@ -33,6 +46,7 @@ from app.services.security import (
 )
 
 router = APIRouter(prefix="/api/v1")
+logger = logging.getLogger(__name__)
 Db = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 CurrentSession = Annotated[UserSession, Depends(get_current_session)]
@@ -84,6 +98,41 @@ def new_user_session(db: Session, user: User) -> tuple[str, str]:
     )
     db.commit()
     return token, csrf
+
+
+def remove_expired_guest_accounts(db: Session) -> None:
+    now = datetime.now(timezone.utc)
+    for user in db.scalars(select(User).where(User.is_guest.is_(True))).all():
+        if not any(
+            session.expires_at.replace(tzinfo=timezone.utc) > now for session in user.sessions
+        ):
+            db.delete(user)
+    db.commit()
+
+
+def send_password_reset_email(email: str, token: str) -> None:
+    if not settings.smtp_host or not settings.smtp_from_email:
+        raise RuntimeError("SMTP_HOST and SMTP_FROM_EMAIL must be configured.")
+    reset_url = f"{settings.frontend_base_url.rstrip('/')}/#reset_token={quote(token)}"
+    message = EmailMessage()
+    message["Subject"] = "Reset your LOUF AI password"
+    message["From"] = settings.smtp_from_email
+    message["To"] = email
+    message.set_content(
+        f"Use this link to reset your LOUF AI password. It expires in 30 minutes:\n\n{reset_url}\n\n"
+        "If you did not request this, you can ignore this email."
+    )
+    if settings.smtp_use_tls:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as client:
+            client.starttls()
+            if settings.smtp_username:
+                client.login(settings.smtp_username, settings.smtp_password)
+            client.send_message(message)
+    else:
+        with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=15) as client:
+            if settings.smtp_username:
+                client.login(settings.smtp_username, settings.smtp_password)
+            client.send_message(message)
 
 
 @router.get("/health")
@@ -146,6 +195,28 @@ def register(
     return user
 
 
+@router.post("/auth/guest", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def create_guest_session(
+    request: Request,
+    response: Response,
+    db: Db,
+) -> User:
+    verify_csrf_cookie(request)
+    check_auth_rate_limit(request)
+    remove_expired_guest_accounts(db)
+    user = User(
+        email=f"guest+{secrets.token_urlsafe(18)}@guest.louf.invalid",
+        password_hash=hash_password(secrets.token_urlsafe(32)),
+        role="guest",
+        is_guest=True,
+    )
+    db.add(user)
+    db.flush()
+    token, csrf = new_user_session(db, user)
+    set_session_cookies(response, token, csrf)
+    return user
+
+
 @router.post("/auth/login", response_model=UserOut)
 def login(data: Credentials, request: Request, response: Response, db: Db) -> User:
     verify_csrf_cookie(request)
@@ -158,10 +229,79 @@ def login(data: Credentials, request: Request, response: Response, db: Db) -> Us
     return user
 
 
+@router.post("/auth/password-reset/request")
+def request_password_reset(
+    data: PasswordResetRequest,
+    request: Request,
+    db: Db,
+) -> dict[str, str]:
+    verify_csrf_cookie(request)
+    check_auth_rate_limit(request)
+    if not settings.smtp_host or not settings.smtp_from_email:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Password recovery is not configured. Set SMTP_HOST and SMTP_FROM_EMAIL, then retry.",
+        )
+    user = db.scalar(select(User).where(User.email == str(data.email).strip().lower()))
+    if user and not user.is_guest:
+        token = secrets.token_urlsafe(32)
+        reset = PasswordResetToken(
+            user_id=user.id,
+            token_hash=token_digest(token),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        )
+        db.add(reset)
+        db.commit()
+        try:
+            send_password_reset_email(user.email, token)
+        except (OSError, smtplib.SMTPException, RuntimeError):
+            db.delete(reset)
+            db.commit()
+            logger.exception("Could not send password reset email.")
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Could not send the recovery email. Check SMTP configuration and retry.",
+            ) from None
+    return {"message": "If that account exists, a password reset email has been sent."}
+
+
+@router.post("/auth/password-reset/confirm")
+def confirm_password_reset(
+    data: PasswordResetConfirm,
+    request: Request,
+    db: Db,
+) -> dict[str, str]:
+    verify_csrf_cookie(request)
+    reset = db.scalar(
+        select(PasswordResetToken).where(
+            PasswordResetToken.token_hash == token_digest(data.token)
+        )
+    )
+    if not reset or reset.expires_at.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+        if reset:
+            db.delete(reset)
+            db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This password reset link is invalid or expired.")
+    user = db.get(User, reset.user_id)
+    if user is None or user.is_guest:
+        db.delete(reset)
+        db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This password reset link is invalid or expired.")
+    user.password_hash = hash_password(data.password)
+    db.query(PasswordResetToken).filter(PasswordResetToken.user_id == user.id).delete()
+    db.query(UserSession).filter(UserSession.user_id == user.id).delete()
+    db.commit()
+    return {"message": "Password updated. Sign in with your new password."}
+
+
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(request: Request, response: Response, db: Db, session: CurrentSession) -> Response:
     verify_csrf_cookie(request)
-    db.delete(session)
+    user = db.get(User, session.user_id)
+    if user and user.is_guest:
+        db.delete(user)
+    else:
+        db.delete(session)
     db.commit()
     response.delete_cookie("louf_session", path="/", secure=settings.cookie_secure, httponly=True)
     response.delete_cookie("louf_csrf", path="/", secure=settings.cookie_secure)
@@ -187,46 +327,54 @@ def delete_account(request: Request, response: Response, db: Db, user: CurrentUs
 
 @router.get("/models")
 async def list_models() -> dict[str, object]:
-    url = f"{settings.ollama_base_url.rstrip('/')}/api/tags"
+    if not settings.bionic_api_base_url.strip():
+        return {
+            "connected": False,
+            "provider": "Bionic",
+            "models": [],
+            "message": "Configure BIONIC_API_BASE_URL in python-backend\\.env to connect Bionic.",
+        }
+    url = f"{settings.bionic_api_base_url.rstrip('/')}/models"
+    headers = {"Authorization": f"Bearer {settings.bionic_api_key}"} if settings.bionic_api_key else {}
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.get(url)
+            response = await client.get(url, headers=headers)
             response.raise_for_status()
             data = response.json()
     except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError):
         return {
             "connected": False,
-            "provider": "Ollama",
+            "provider": "Bionic",
             "models": [],
-            "message": "Ollama is not reachable. Start Ollama and try again.",
+            "message": "Bionic could not be reached. Check the endpoint, API key, and model API compatibility.",
         }
-    if not isinstance(data, dict) or not isinstance(data.get("models", []), list):
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
         return {
             "connected": False,
-            "provider": "Ollama",
+            "provider": "Bionic",
             "models": [],
-            "message": "Ollama returned an unexpected model-list response.",
+            "message": "Bionic returned an unexpected model-list response. The endpoint must support the OpenAI-compatible API.",
         }
+    models = [
+        {"name": item["id"], "size": None}
+        for item in data["data"]
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    ]
     return {
         "connected": True,
-        "provider": "Ollama",
-        "models": [
-            {
-                "name": item["name"],
-                "size": item.get("size"),
-                "modified_at": item.get("modified_at"),
-            }
-            for item in data.get("models", [])
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        ],
-        "message": None,
+        "provider": "Bionic",
+        "models": models,
+        "message": "No models are available from the configured Bionic endpoint." if not models else None,
     }
 
 
 @router.get("/capabilities")
 def capabilities() -> dict[str, object]:
     return {
-        "chat": {"provider": "Ollama", "configured": True},
+        "chat": {
+            "provider": "Bionic",
+            "configured": bool(settings.bionic_api_base_url.strip()),
+        },
         "images": {
             "configured": False,
             "available": False,
@@ -332,12 +480,12 @@ async def send_message(
     if not model_response["connected"]:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Ollama is unavailable. Start the local Ollama service and retry.",
+            model_response["message"] or "Bionic is unavailable. Check its configuration and retry.",
         )
     if data.model not in available:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "The selected model is not installed in Ollama. Select an available model.",
+            "The selected model is not available from Bionic. Select an available model.",
         )
 
     history = list(
@@ -359,31 +507,46 @@ async def send_message(
         messages.append({"role": "system", "content": data.system_instructions})
     messages.extend({"role": msg.role, "content": msg.content} for msg in history[-30:])
     messages.append({"role": "user", "content": data.prompt})
-    ollama_url = f"{settings.ollama_base_url.rstrip('/')}/api/chat"
+    chat_url = f"{settings.bionic_api_base_url.rstrip('/')}/chat/completions"
     payload = {"model": data.model, "messages": messages, "stream": True}
+    headers = {"Authorization": f"Bearer {settings.bionic_api_key}"} if settings.bionic_api_key else {}
 
     async def stream():
         answer: list[str] = []
         failure: str | None = None
         try:
-            timeout = httpx.Timeout(settings.ollama_timeout_seconds, connect=5)
+            timeout = httpx.Timeout(settings.bionic_timeout_seconds, connect=5)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("POST", ollama_url, json=payload) as upstream:
+                async with client.stream("POST", chat_url, json=payload, headers=headers) as upstream:
                     upstream.raise_for_status()
                     async for line in upstream.aiter_lines():
-                        if not line:
+                        if not line or not line.startswith("data: "):
                             continue
-                        item = json.loads(line)
+                        event_data = line[6:]
+                        if event_data == "[DONE]":
+                            break
+                        item = json.loads(event_data)
                         if not isinstance(item, dict):
-                            raise json.JSONDecodeError("Expected an object", line, 0)
-                        content = item.get("message", {}).get("content", "")
+                            raise json.JSONDecodeError("Expected an object", event_data, 0)
+                        if item.get("error"):
+                            raise ValueError("Bionic reported a streaming error.")
+                        choices = item.get("choices")
+                        content = ""
+                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                            delta = choices[0].get("delta", {})
+                            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                                content = delta["content"]
                         if content:
                             answer.append(content)
                             yield f"data: {json.dumps({'delta': content})}\n\n"
-                        if item.get("done"):
-                            break
-        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError, AttributeError):
-            failure = "The local model request failed. Check Ollama and the selected model, then retry."
+                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                            if choices[0].get("finish_reason") is not None:
+                                break
+        except ValueError:
+            failure = "Bionic returned an invalid streaming response. Check its API compatibility and retry."
+        except (httpx.RequestError, httpx.HTTPStatusError, json.JSONDecodeError, AttributeError) as error:
+            logger.warning("Bionic chat request failed: %s", error)
+            failure = "The Bionic model request failed. Check the endpoint, credentials, and selected model, then retry."
         if failure:
             yield f"data: {json.dumps({'error': failure})}\n\n"
             return

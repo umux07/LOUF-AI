@@ -4,6 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.api.routes import _attempts
 from app.database.base import Base
 from app.database.session import get_db
 from app.main import app
@@ -19,6 +20,7 @@ TestingSession = sessionmaker(bind=test_engine, autoflush=False, expire_on_commi
 
 @pytest.fixture
 def client():
+    _attempts.clear()
     Base.metadata.create_all(test_engine)
 
     def override_get_db():
@@ -33,6 +35,7 @@ def client():
         yield test_client
     app.dependency_overrides.clear()
     Base.metadata.drop_all(test_engine)
+    _attempts.clear()
 
 
 def register(client: TestClient, email: str) -> TestClient:

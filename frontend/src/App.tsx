@@ -4,14 +4,14 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
   Activity, ArrowUp, Check, ChevronDown, CircleHelp, Copy, GalleryVerticalEnd,
-  Image, LoaderCircle, LogOut, Menu, MessageSquarePlus, MoreHorizontal, Plus,
+  Image, LoaderCircle, LogOut, Menu, MessageSquarePlus, MoreHorizontal, Pencil, Plus,
   Search, Settings, ShieldCheck, Sparkles, Trash2, Video, X,
 } from 'lucide-react'
 import './App.css'
 
 const API = '/api/v1'
 
-type User = { id: string; email: string; role: string; created_at: string }
+type User = { id: string; email: string; role: string; is_guest: boolean; created_at: string }
 type Conversation = { id: string; title: string; created_at: string; updated_at: string }
 type Message = { id: string; role: 'user' | 'assistant'; content: string; model?: string | null }
 type ModelStatus = { connected: boolean; provider: string; models: { name: string; size: number | null }[]; message: string | null }
@@ -46,7 +46,10 @@ function App() {
   const [user, setUser] = useState<User | null>(null)
   const [authReady, setAuthReady] = useState(false)
   const [registering, setRegistering] = useState(false)
+  const [forgotPassword, setForgotPassword] = useState(false)
+  const [resetToken, setResetToken] = useState(() => new URLSearchParams(window.location.hash.slice(1)).get('reset_token') ?? '')
   const [authError, setAuthError] = useState('')
+  const [authNotice, setAuthNotice] = useState('')
   const [busy, setBusy] = useState(false)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -65,6 +68,8 @@ function App() {
   const [appError, setAppError] = useState('')
   const [dark, setDark] = useState(() => localStorage.getItem('louf-theme') === 'dark')
   const [copiedId, setCopiedId] = useState('')
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameTitle, setRenameTitle] = useState('')
   const endRef = useRef<HTMLDivElement>(null)
   const promptRef = useRef<HTMLTextAreaElement>(null)
   const activeRequest = useRef<AbortController | null>(null)
@@ -97,12 +102,26 @@ function App() {
 
   useEffect(() => {
     if (!user) return
-    Promise.all([
-      refreshConversations(),
-      refreshModels().catch((error: Error) => setAppError(error.message)),
-      api<Capabilities>('/capabilities').then(setCapabilities),
-    ]).catch((error: Error) => setAppError(error.message))
-  }, [user, refreshConversations, refreshModels])
+    let active = true
+    async function loadWorkspace() {
+      try {
+        const [rows, status, available] = await Promise.all([
+          api<Conversation[]>('/conversations'),
+          api<ModelStatus>('/models'),
+          api<Capabilities>('/capabilities'),
+        ])
+        if (!active) return
+        setConversations(rows)
+        setModels(status)
+        setSelectedModel((current) => current || status.models[0]?.name || '')
+        setCapabilities(available)
+      } catch (error) {
+        if (active) setAppError((error as Error).message)
+      }
+    }
+    void loadWorkspace()
+    return () => { active = false }
+  }, [user])
 
   useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [messages, sending])
 
@@ -123,17 +142,63 @@ function App() {
     event.preventDefault()
     setBusy(true)
     setAuthError('')
+    setAuthNotice('')
     try {
-      const endpoint = registering ? '/auth/register' : '/auth/login'
-      const result = await api<User>(endpoint, {
-        method: 'POST',
-        body: JSON.stringify({ email, password }),
-      })
-      setUser(result)
+      if (resetToken) {
+        const result = await api<{ message: string }>('/auth/password-reset/confirm', {
+          method: 'POST',
+          body: JSON.stringify({ token: resetToken, password }),
+        })
+        setResetToken('')
+        window.history.replaceState({}, '', window.location.pathname + window.location.search)
+        setPassword('')
+        setAuthNotice(result.message)
+      } else if (forgotPassword) {
+        const result = await api<{ message: string }>('/auth/password-reset/request', {
+          method: 'POST',
+          body: JSON.stringify({ email }),
+        })
+        setAuthNotice(result.message)
+      } else {
+        const endpoint = registering ? '/auth/register' : '/auth/login'
+        const result = await api<User>(endpoint, {
+          method: 'POST',
+          body: JSON.stringify({ email, password }),
+        })
+        setUser(result)
+      }
     } catch (error) {
       setAuthError((error as Error).message)
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function continueAsGuest() {
+    setBusy(true)
+    setAuthError('')
+    try {
+      setUser(await api<User>('/auth/guest', { method: 'POST' }))
+    } catch (error) {
+      setAuthError((error as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function saveConversationTitle(event: FormEvent, id: string) {
+    event.preventDefault()
+    const title = renameTitle.trim()
+    if (!title) return
+    try {
+      const updated = await api<Conversation>(`/conversations/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title }),
+      })
+      setConversations((rows) => rows.map((item) => item.id === id ? updated : item))
+      setRenamingId(null)
+    } catch (error) {
+      setAppError((error as Error).message)
     }
   }
 
@@ -176,7 +241,7 @@ function App() {
     const text = (retryText ?? prompt).trim()
     if (!text || sending) return
     if (!selectedModel) {
-      setAppError('Install a local Ollama model, then choose it before sending a message.')
+      setAppError('Connect Bionic and select an available model before sending a message.')
       return
     }
     setAppError('')
@@ -269,7 +334,7 @@ function App() {
 
   if (!authReady) return <div className="boot-screen"><Sparkles size={22} /> LOUF AI</div>
 
-  if (!user) {
+  if (!user || resetToken) {
     return (
       <main className="auth-screen">
         <div className="auth-art">
@@ -279,26 +344,30 @@ function App() {
             <span className="eyebrow">YOUR PRIVATE AI WORKSPACE</span>
             <h1>Ideas, meet<br /><em>intelligence.</em></h1>
             <p>A thoughtful space for creating with AI — built to run close to home.</p>
-            <div className="local-chip"><span className="status-dot" /> Local-first by design</div>
+            <div className="local-chip"><span className="status-dot" /> Private by design</div>
           </div>
           <div className="auth-art-foot">LOUF AI <span>·</span> PERSONAL INTELLIGENCE</div>
         </div>
         <section className="auth-panel">
           <form onSubmit={submitAuth} className="auth-form">
-            <span className="eyebrow">{registering ? 'GET STARTED' : 'WELCOME BACK'}</span>
-            <h2>{registering ? 'Create your account' : 'Sign in to LOUF'}</h2>
-            <p className="muted">{registering ? 'Set up your private workspace.' : 'Your conversations are waiting.'}</p>
-            <label htmlFor="email">Email address</label>
-            <input id="email" type="email" autoComplete="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
-            <label htmlFor="password">Password</label>
-            <input id="password" type="password" autoComplete={registering ? 'new-password' : 'current-password'} minLength={12} required value={password} onChange={(e) => setPassword(e.target.value)} />
-            <small className="field-hint">Use at least 12 characters.</small>
+            <span className="eyebrow">{resetToken ? 'SECURE PASSWORD RESET' : forgotPassword ? 'ACCOUNT RECOVERY' : registering ? 'GET STARTED' : 'WELCOME BACK'}</span>
+            <h2>{resetToken ? 'Choose a new password' : forgotPassword ? 'Reset your password' : registering ? 'Create your account' : 'Sign in to LOUF'}</h2>
+            <p className="muted">{resetToken ? 'Choose a new password for your account.' : forgotPassword ? 'We’ll email a secure reset link if the account exists.' : registering ? 'Set up your private workspace.' : 'Your conversations are waiting.'}</p>
+            {!resetToken && <><label htmlFor="email">Email address</label>
+            <input id="email" type="email" autoComplete="email" required value={email} onChange={(e) => setEmail(e.target.value)} /></>}
+            {!forgotPassword && <><label htmlFor="password">Password</label>
+            <input id="password" type="password" autoComplete={registering || resetToken ? 'new-password' : 'current-password'} minLength={12} required value={password} onChange={(e) => setPassword(e.target.value)} />
+            <small className="field-hint">Use at least 12 characters.</small></>}
             {authError && <div className="inline-error" role="alert">{authError}</div>}
+            {authNotice && <div className="inline-notice" role="status">{authNotice}</div>}
             <button className="primary-button auth-submit" disabled={busy}>
-              {busy ? <LoaderCircle className="spin" size={17} /> : registering ? 'Create account' : 'Sign in'}
+              {busy ? <LoaderCircle className="spin" size={17} /> : resetToken ? 'Update password' : forgotPassword ? 'Send reset link' : registering ? 'Create account' : 'Sign in'}
               {!busy && <ArrowUp size={16} />}
             </button>
-            <p className="auth-switch">{registering ? 'Already have an account?' : 'New to LOUF AI?'} <button type="button" onClick={() => { setRegistering(!registering); setAuthError('') }}>{registering ? 'Sign in' : 'Create account'}</button></p>
+            {!registering && !forgotPassword && !resetToken && <p className="auth-switch"><button type="button" onClick={() => { setForgotPassword(true); setAuthError(''); setAuthNotice('') }}>Forgot password?</button></p>}
+            {!resetToken && <p className="auth-switch">{forgotPassword ? 'Remembered your password?' : registering ? 'Already have an account?' : 'New to LOUF AI?'} <button type="button" onClick={() => { setForgotPassword(false); setRegistering(forgotPassword ? false : !registering); setAuthError(''); setAuthNotice('') }}>{forgotPassword || registering ? 'Sign in' : 'Create account'}</button></p>}
+            {!registering && !forgotPassword && !resetToken && <button className="secondary-button guest-button" type="button" disabled={busy} onClick={() => void continueAsGuest()}><Sparkles size={15} /> Continue as guest</button>}
+            {!registering && !forgotPassword && !resetToken && <p className="guest-note">Temporary private session. Your chats are deleted when you sign out or the session expires.</p>}
             <div className="privacy-note"><ShieldCheck size={15} /> Your account and sessions are protected.</div>
           </form>
         </section>
@@ -331,15 +400,14 @@ function App() {
         <div className="conversation-list">
           {filteredConversations.length ? filteredConversations.map((item) => (
             <div key={item.id} className={`conversation-row ${selectedId === item.id ? 'selected' : ''}`}>
-              <button className="conversation-link" onClick={() => { setSelectedId(item.id); setSection('chat'); setMobileOpen(false) }}><span className="conversation-title">{item.title}</span></button>
-              <button className="icon-button conversation-delete" aria-label={`Delete ${item.title}`} onClick={() => removeConversation(item.id)}><Trash2 size={14} /></button>
+              {renamingId === item.id ? <form className="conversation-rename-form" onSubmit={(event) => void saveConversationTitle(event, item.id)}><input autoFocus aria-label="Conversation title" value={renameTitle} maxLength={160} onChange={(event) => setRenameTitle(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') setRenamingId(null) }} /><button className="icon-button" aria-label="Save conversation title"><Check size={14} /></button><button className="icon-button" type="button" aria-label="Cancel rename" onClick={() => setRenamingId(null)}><X size={14} /></button></form> : <><button className="conversation-link" onClick={() => { setSelectedId(item.id); setSection('chat'); setMobileOpen(false) }}><span className="conversation-title">{item.title}</span></button><button className="icon-button conversation-rename" aria-label={`Rename ${item.title}`} onClick={() => { setRenamingId(item.id); setRenameTitle(item.title) }}><Pencil size={14} /></button><button className="icon-button conversation-delete" aria-label={`Delete ${item.title}`} onClick={() => removeConversation(item.id)}><Trash2 size={14} /></button></>}
             </div>
           )) : <p className="side-empty">{search ? 'No matching conversations' : 'Your chats will appear here'}</p>}
         </div>
         <div className="sidebar-bottom">
-          <div className="model-mini"><span className={`status-dot ${models?.connected ? 'online' : 'offline'}`} /><div><strong>{models?.connected ? `${models.models.length} local models` : 'Model offline'}</strong><small>{models?.connected ? 'Ollama connected' : 'Check connection'}</small></div><button className="icon-button" onClick={() => setSection('settings')} aria-label="Model settings"><ChevronDown size={16} /></button></div>
+          <div className="model-mini"><span className={`status-dot ${models?.connected ? 'online' : 'offline'}`} /><div><strong>{models?.connected ? `${models.models.length} available models` : 'Bionic offline'}</strong><small>{models?.connected ? 'Bionic connected' : 'Check connection'}</small></div><button className="icon-button" onClick={() => setSection('settings')} aria-label="Model settings"><ChevronDown size={16} /></button></div>
           <button className={`nav-item settings-link ${section === 'settings' ? 'active' : ''}`} onClick={() => { setSection('settings'); setMobileOpen(false) }}><Settings size={17} /><span>Settings</span></button>
-          <div className="profile-row"><div className="avatar">{user.email.slice(0, 1).toUpperCase()}</div><div className="profile-details"><strong>{user.email.split('@')[0]}</strong><small>{user.email}</small></div><button className="icon-button" aria-label="Sign out" onClick={logout}><LogOut size={16} /></button></div>
+          <div className="profile-row"><div className="avatar">{user.is_guest ? 'G' : user.email.slice(0, 1).toUpperCase()}</div><div className="profile-details"><strong>{user.is_guest ? 'Guest session' : user.email.split('@')[0]}</strong><small>{user.is_guest ? 'Temporary · chats expire' : user.email}</small></div><button className="icon-button" aria-label={user.is_guest ? 'End guest session' : 'Sign out'} onClick={logout}><LogOut size={16} /></button></div>
         </div>
       </aside>
 
@@ -363,7 +431,7 @@ function App() {
                   <div className="suggestion-grid">
                     {['Help me brainstorm a fresh idea', 'Explain something in simple terms', 'Help me write or refine a draft'].map((suggestion) => <button key={suggestion} onClick={() => { setPrompt(suggestion); promptRef.current?.focus() }}>{suggestion}<ArrowUp size={14} /></button>)}
                   </div>
-                  {!models?.connected && <div className="connect-callout"><CircleHelp size={17} /><span><strong>Connect a local model to begin.</strong> Start Ollama and install a model to chat privately.</span><button onClick={() => setSection('settings')}>Setup guide</button></div>}
+                  {!models?.connected && <div className="connect-callout"><CircleHelp size={17} /><span><strong>Connect Bionic to begin.</strong> Configure your Bionic-compatible API endpoint on the backend.</span><button onClick={() => setSection('settings')}>Setup guide</button></div>}
                 </div>
               ) : (
                 <div className="messages">
@@ -384,10 +452,10 @@ function App() {
             </div>
             <form className="composer-wrap" onSubmit={(event) => void sendMessage(event)}>
               <div className="composer">
-                <textarea ref={promptRef} rows={1} placeholder={models?.connected ? 'Message LOUF AI…' : 'Connect Ollama to start a conversation'} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage() } }} aria-label="Message" />
-                <div className="composer-bottom"><div className="composer-model"><span className={`status-dot ${models?.connected ? 'online' : 'offline'}`} /><select aria-label="Select model" value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} disabled={!models?.models.length}><option value="">{models?.models.length ? 'Choose a model' : 'No local models'}</option>{models?.models.map((model) => <option key={model.name} value={model.name}>{model.name}</option>)}</select><ChevronDown size={13} /></div><div className="composer-actions"><span>Local models only</span>{sending ? <button type="button" className="cancel-button" aria-label="Cancel generation" onClick={() => activeRequest.current?.abort()}><X size={16} /> Stop</button> : <button className="send-button" aria-label="Send message" disabled={!prompt.trim()}><ArrowUp size={18} /></button>}</div></div>
+                <textarea ref={promptRef} rows={1} placeholder={models?.connected ? 'Message LOUF AI…' : 'Connect Bionic to start a conversation'} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage() } }} aria-label="Message" />
+                <div className="composer-bottom"><div className="composer-model"><span className={`status-dot ${models?.connected ? 'online' : 'offline'}`} /><select aria-label="Select model" value={selectedModel} onChange={(event) => setSelectedModel(event.target.value)} disabled={!models?.models.length}><option value="">{models?.models.length ? 'Choose a model' : 'No models available'}</option>{models?.models.map((model) => <option key={model.name} value={model.name}>{model.name}</option>)}</select><ChevronDown size={13} /></div><div className="composer-actions"><span>Bionic API</span>{sending ? <button type="button" className="cancel-button" aria-label="Cancel generation" onClick={() => activeRequest.current?.abort()}><X size={16} /> Stop</button> : <button className="send-button" aria-label="Send message" disabled={!prompt.trim()}><ArrowUp size={18} /></button>}</div></div>
               </div>
-              <p className="composer-note">AI can make mistakes. Your prompts stay on your configured local service.</p>
+              <p className="composer-note">AI can make mistakes. Your prompts are sent to the Bionic endpoint configured by your workspace.</p>
             </form>
           </section>
         )}
@@ -402,11 +470,11 @@ function App() {
 
         {section === 'settings' && (
           <section className="settings-page">
-            <div className="settings-intro"><span className="eyebrow">PREFERENCES</span><h1>Settings</h1><p>Manage your local AI connections and personal workspace.</p></div>
-            <div className="settings-section"><div className="settings-title"><div><h2>Local chat model</h2><p>Chat inference runs through your Ollama installation.</p></div><span className={`status-pill ${models?.connected ? 'pill-good' : ''}`}><span className={`status-dot ${models?.connected ? 'online' : 'offline'}`} />{models?.connected ? 'CONNECTED' : 'OFFLINE'}</span></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><Activity size={18} /></div><div><strong>{models?.connected ? 'Ollama is reachable' : 'Ollama is not reachable'}</strong><p>{models?.connected ? `${models.models.length} model${models.models.length === 1 ? '' : 's'} available on this device.` : models?.message ?? 'Start Ollama on this device, then check the connection.'}</p></div></div><button className="secondary-button" onClick={() => void refreshModels().catch((error: Error) => setAppError(error.message))}><Activity size={14} /> Check connection</button></div>{models?.connected && !models.models.length && <div className="setup-tip"><strong>No models installed yet</strong><p>Install Ollama, then in PowerShell run <code>ollama pull llama3.2:1b</code> to download a small chat model. Model download requires your consent and disk space.</p></div>}{models?.connected && models.models.length > 0 && <div className="model-list">{models.models.map((model) => <div key={model.name}><span className="status-dot online" /><strong>{model.name}</strong><small>{model.size ? `${(model.size / (1024 ** 3)).toFixed(1)} GB` : 'Installed locally'}</small></div>)}</div>}</div>
+            <div className="settings-intro"><span className="eyebrow">PREFERENCES</span><h1>Settings</h1><p>Manage your Bionic connection and personal workspace.</p></div>
+            <div className="settings-section"><div className="settings-title"><div><h2>Bionic chat provider</h2><p>Chat requests use the Bionic-compatible endpoint configured on the backend.</p></div><span className={`status-pill ${models?.connected ? 'pill-good' : ''}`}><span className={`status-dot ${models?.connected ? 'online' : 'offline'}`} />{models?.connected ? 'CONNECTED' : 'OFFLINE'}</span></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><Activity size={18} /></div><div><strong>{models?.connected ? 'Bionic is reachable' : 'Bionic is not connected'}</strong><p>{models?.connected ? `${models.models.length} model${models.models.length === 1 ? '' : 's'} available from the configured endpoint.` : models?.message ?? 'Configure BIONIC_API_BASE_URL on the backend, then check the connection.'}</p></div></div><button className="secondary-button" onClick={() => void refreshModels().catch((error: Error) => setAppError(error.message))}><Activity size={14} /> Check connection</button></div>{models?.connected && !models.models.length && <div className="setup-tip"><strong>No models available</strong><p>Check that your Bionic deployment has at least one model enabled and that its OpenAI-compatible <code>/models</code> endpoint is enabled.</p></div>}{models?.connected && models.models.length > 0 && <div className="model-list">{models.models.map((model) => <div key={model.name}><span className="status-dot online" /><strong>{model.name}</strong><small>Available from Bionic</small></div>)}</div>}<div className="setup-tip"><strong>Configure Bionic securely</strong><p>Set <code>BIONIC_API_BASE_URL</code> and, if required, <code>BIONIC_API_KEY</code> in <code>python-backend\\.env</code>, then restart the backend. Credentials are never sent to the browser. The endpoint must support OpenAI-compatible <code>/models</code> and streaming <code>/chat/completions</code>.</p></div></div>
             <div className="settings-section"><div className="settings-title"><div><h2>Image &amp; video providers</h2><p>These features require separately installed compatible services.</p></div></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><Image size={18} /></div><div><strong>Image generation · Not configured</strong><p>{capabilities?.images.message}</p></div></div></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><Video size={18} /></div><div><strong>Video generation · Not configured</strong><p>{capabilities?.videos.message}</p></div></div></div></div>
-            <div className="settings-section account-section"><div className="settings-title"><div><h2>Account</h2><p>Signed in as {user.email}</p></div></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><ShieldCheck size={18} /></div><div><strong>Private workspace</strong><p>Your conversation history is private to your account. Session cookie is HTTP-only.</p></div></div><button className="secondary-button danger-button" onClick={() => { if (window.confirm('Permanently delete your account and all conversations? This cannot be undone.')) void api('/users/me', { method: 'DELETE' }).then(() => setUser(null)).catch((error: Error) => setAppError(error.message)) }}><Trash2 size={14} /> Delete account</button></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><MoreHorizontal size={18} /></div><div><strong>Theme</strong><p>Choose a comfortable appearance for your workspace.</p></div></div><button className="secondary-button" onClick={() => setDark(!dark)}>{dark ? 'Use light theme' : 'Use dark theme'}</button></div></div>
-            <div className="settings-footer">Password reset and email verification need an outbound email service and are not configured in this local setup.</div>
+            <div className="settings-section account-section"><div className="settings-title"><div><h2>Account</h2><p>{user.is_guest ? 'Using a temporary guest session' : `Signed in as ${user.email}`}</p></div></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><ShieldCheck size={18} /></div><div><strong>{user.is_guest ? 'Temporary private workspace' : 'Private workspace'}</strong><p>{user.is_guest ? 'Chats are isolated to this guest session and deleted when you sign out or it expires.' : 'Your conversation history is private to your account. Session cookie is HTTP-only.'}</p></div></div>{user.is_guest ? <button className="secondary-button danger-button" onClick={() => void logout()}><LogOut size={14} /> End guest session</button> : <button className="secondary-button danger-button" onClick={() => { if (window.confirm('Permanently delete your account and all conversations? This cannot be undone.')) void api('/users/me', { method: 'DELETE' }).then(() => setUser(null)).catch((error: Error) => setAppError(error.message)) }}><Trash2 size={14} /> Delete account</button>}</div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><MoreHorizontal size={18} /></div><div><strong>Theme</strong><p>Choose a comfortable appearance for your workspace.</p></div></div><button className="secondary-button" onClick={() => setDark(!dark)}>{dark ? 'Use light theme' : 'Use dark theme'}</button></div></div>
+            <div className="settings-footer">Password recovery links expire after 30 minutes. Configure SMTP_HOST and SMTP_FROM_EMAIL on the server to deliver them.</div>
           </section>
         )}
       </main>

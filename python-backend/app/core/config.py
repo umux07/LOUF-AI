@@ -6,12 +6,20 @@ class Settings(BaseSettings):
     app_env: str = "development"
     secret_key: str = "development-only-change-me"
     database_url: str = "sqlite:///./louf_ai.db"
-    frontend_origins: str = "http://localhost:5173"
+    frontend_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     cookie_secure: bool = False
     session_ttl_hours: int = 168
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_timeout_seconds: float = 180
+    bionic_api_base_url: str = ""
+    bionic_api_key: str = ""
+    bionic_timeout_seconds: float = 180
     storage_dir: str = "./storage"
+    frontend_base_url: str = "http://localhost:5173"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_use_tls: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

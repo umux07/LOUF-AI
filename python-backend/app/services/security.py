@@ -41,7 +41,11 @@ def get_current_session(
     session = db.scalar(select(UserSession).where(UserSession.token_hash == token_digest(token)))
     if not session or session.expires_at.replace(tzinfo=timezone.utc).timestamp() <= time.time():
         if session:
-            db.delete(session)
+            user = db.get(User, session.user_id)
+            if user and user.is_guest:
+                db.delete(user)
+            else:
+                db.delete(session)
             db.commit()
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Your session has expired. Please sign in.")
     return session

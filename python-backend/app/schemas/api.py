@@ -8,10 +8,20 @@ class Credentials(BaseModel):
     password: str = Field(min_length=12, max_length=128)
 
 
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str = Field(min_length=32, max_length=256)
+    password: str = Field(min_length=12, max_length=128)
+
+
 class UserOut(BaseModel):
     id: str
     email: str
     role: str
+    is_guest: bool
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
 
