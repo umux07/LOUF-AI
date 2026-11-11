@@ -15,9 +15,18 @@ type User = { id: string; email: string; role: string; is_guest: boolean; create
 type Conversation = { id: string; title: string; created_at: string; updated_at: string }
 type Message = { id: string; role: 'user' | 'assistant'; content: string; model?: string | null }
 type ModelStatus = { connected: boolean; provider: string; models: { name: string; size: number | null }[]; message: string | null }
+type MediaJob = {
+  id: string
+  media_type: 'image' | 'video'
+  prompt: string
+  status: 'queued' | 'processing' | 'completed' | 'failed'
+  error: string | null
+  created_at: string
+  file_url: string | null
+}
 type Capabilities = {
-  images: { available: boolean; message: string }
-  videos: { available: boolean; message: string }
+  images: { available: boolean; message: string; provider: string }
+  videos: { available: boolean; message: string; provider: string }
 }
 type Section = 'chat' | 'images' | 'videos' | 'gallery' | 'settings'
 
@@ -60,8 +69,11 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [models, setModels] = useState<ModelStatus | null>(null)
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null)
+  const [mediaJobs, setMediaJobs] = useState<MediaJob[]>([])
   const [selectedModel, setSelectedModel] = useState('')
   const [prompt, setPrompt] = useState('')
+  const [imagePrompt, setImagePrompt] = useState('')
+  const [videoPrompt, setVideoPrompt] = useState('')
   const [search, setSearch] = useState('')
   const [loadingMessages, setLoadingMessages] = useState(false)
   const [sending, setSending] = useState(false)
@@ -88,6 +100,12 @@ function App() {
     return rows
   }, [])
 
+  const refreshMediaJob = useCallback(async (id: string) => {
+    const updated = await api<MediaJob>(`/media/jobs/${id}`)
+    setMediaJobs((jobs) => jobs.map((job) => job.id === id ? updated : job))
+    return updated
+  }, [])
+
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light'
     localStorage.setItem('louf-theme', dark ? 'dark' : 'light')
@@ -105,16 +123,18 @@ function App() {
     let active = true
     async function loadWorkspace() {
       try {
-        const [rows, status, available] = await Promise.all([
+        const [rows, status, available, generatedMedia] = await Promise.all([
           api<Conversation[]>('/conversations'),
           api<ModelStatus>('/models'),
           api<Capabilities>('/capabilities'),
+          api<MediaJob[]>('/media/jobs'),
         ])
         if (!active) return
         setConversations(rows)
         setModels(status)
         setSelectedModel((current) => current || status.models[0]?.name || '')
         setCapabilities(available)
+        setMediaJobs(generatedMedia)
       } catch (error) {
         if (active) setAppError((error as Error).message)
       }
@@ -122,6 +142,24 @@ function App() {
     void loadWorkspace()
     return () => { active = false }
   }, [user])
+
+  useEffect(() => {
+    if (!user || !mediaJobs.some((job) => job.status === 'queued' || job.status === 'processing')) return
+    let active = true
+    const poll = async () => {
+      const pending = mediaJobs.filter((job) => job.status === 'queued' || job.status === 'processing')
+      const results = await Promise.allSettled(pending.map((job) => refreshMediaJob(job.id)))
+      if (active) {
+        const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+        if (failed) setAppError((failed.reason as Error).message)
+      }
+    }
+    const timer = window.setInterval(() => { void poll() }, 2500)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [mediaJobs, refreshMediaJob, user])
 
   useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [messages, sending])
 
@@ -323,6 +361,36 @@ function App() {
       setSelectedId(null)
       setConversations([])
       setMessages([])
+      setMediaJobs([])
+    }
+  }
+
+  async function generateMedia(event: FormEvent, mediaType: 'image' | 'video') {
+    event.preventDefault()
+    const text = (mediaType === 'image' ? imagePrompt : videoPrompt).trim()
+    const available = mediaType === 'image' ? capabilities?.images.available : capabilities?.videos.available
+    if (!text || !available) return
+    setAppError('')
+    try {
+      const job = await api<MediaJob>('/media/jobs', {
+        method: 'POST',
+        body: JSON.stringify({ media_type: mediaType, prompt: text }),
+      })
+      setMediaJobs((jobs) => [job, ...jobs.filter((item) => item.id !== job.id)])
+      if (mediaType === 'image') setImagePrompt('')
+      else setVideoPrompt('')
+    } catch (error) {
+      setAppError((error as Error).message)
+    }
+  }
+
+  async function deleteMediaJob(job: MediaJob) {
+    if (!window.confirm('Delete this generated media and its job record? This cannot be undone.')) return
+    try {
+      await api(`/media/jobs/${job.id}`, { method: 'DELETE' })
+      setMediaJobs((jobs) => jobs.filter((item) => item.id !== job.id))
+    } catch (error) {
+      setAppError((error as Error).message)
     }
   }
 
@@ -331,6 +399,10 @@ function App() {
     setCopiedId(message.id)
     window.setTimeout(() => setCopiedId(''), 1400)
   }
+
+  const visibleMediaJobs = section === 'gallery'
+    ? mediaJobs
+    : mediaJobs.filter((job) => job.media_type === (section === 'images' ? 'image' : 'video'))
 
   if (!authReady) return <div className="boot-screen"><Sparkles size={22} /> LOUF AI</div>
 
@@ -462,9 +534,67 @@ function App() {
 
         {(section === 'images' || section === 'videos' || section === 'gallery') && (
           <section className="feature-page">
-            <div className="feature-heading"><div className="welcome-icon">{section === 'images' ? <Image size={20} /> : section === 'videos' ? <Video size={20} /> : <GalleryVerticalEnd size={20} />}</div><span className="eyebrow">CREATIVE WORKSPACE</span><h1>{section === 'images' ? 'Image studio' : section === 'videos' ? 'Video studio' : 'Your gallery'}</h1><p>{section === 'gallery' ? 'Generated media will be organized here when a compatible provider is connected.' : `Create with a local ${section === 'images' ? 'image' : 'video'} model, on your terms.`}</p></div>
-            <div className="unavailable-card"><div className="unavailable-icon"><Activity size={20} /></div><div><span className="status-pill"><span className="status-dot offline" /> NOT CONFIGURED</span><h2>{section === 'images' ? 'No image model connected' : section === 'videos' ? 'No video model connected' : 'Your gallery is ready for your creations'}</h2><p>{section === 'images' ? capabilities?.images.message : section === 'videos' ? capabilities?.videos.message : 'Media appears here after a compatible local generation provider is set up.'}</p><button className="secondary-button" onClick={() => setSection('settings')}><Settings size={15} /> Review provider settings</button></div></div>
-            <div className="honest-note"><ShieldCheck size={16} /><span>No samples or synthetic results are shown. Generated media appears here only after a real provider creates it.</span></div>
+            <div className="feature-heading"><div className="welcome-icon">{section === 'images' ? <Image size={20} /> : section === 'videos' ? <Video size={20} /> : <GalleryVerticalEnd size={20} />}</div><span className="eyebrow">CREATIVE WORKSPACE</span><h1>{section === 'images' ? 'Image studio' : section === 'videos' ? 'Video studio' : 'Your gallery'}</h1><p>{section === 'gallery' ? 'Your generated images and videos are saved privately in this workspace.' : `Create with a local ${section === 'images' ? 'image' : 'video'} workflow in ComfyUI.`}</p></div>
+            {section !== 'gallery' && (
+              <form className="media-prompt-card" onSubmit={(event) => void generateMedia(event, section === 'images' ? 'image' : 'video')}>
+                <label htmlFor={`${section}-prompt`}>{section === 'images' ? 'Describe the image you want to create' : 'Describe the video you want to create'}</label>
+                <textarea
+                  id={`${section}-prompt`}
+                  rows={5}
+                  maxLength={2000}
+                  placeholder={section === 'images'
+                    ? 'A quiet cabin beside a mountain lake at sunrise, soft watercolor style…'
+                    : 'A slow cinematic shot gliding over a forest at sunrise, mist moving through the trees…'}
+                  value={section === 'images' ? imagePrompt : videoPrompt}
+                  onChange={(event) => section === 'images'
+                    ? setImagePrompt(event.target.value)
+                    : setVideoPrompt(event.target.value)}
+                />
+                <div className="media-prompt-footer">
+                  <span>{(section === 'images' ? imagePrompt : videoPrompt).length}/2000</span>
+                  <button className="primary-button media-generate-button" type="submit" disabled={
+                    !(section === 'images' ? capabilities?.images.available : capabilities?.videos.available)
+                    || !(section === 'images' ? imagePrompt : videoPrompt).trim()
+                  }>
+                    <Sparkles size={15} /> Generate {section === 'images' ? 'image' : 'video'}
+                  </button>
+                </div>
+              </form>
+            )}
+            {section !== 'gallery' && !(section === 'images' ? capabilities?.images.available : capabilities?.videos.available) && (
+              <div className="unavailable-card"><div className="unavailable-icon"><Activity size={20} /></div><div><span className="status-pill"><span className="status-dot offline" /> NOT CONFIGURED</span><h2>{section === 'images' ? 'Image workflow not configured' : 'Video workflow not configured'}</h2><p>{section === 'images' ? capabilities?.images.message : capabilities?.videos.message}</p><button className="secondary-button" onClick={() => setSection('settings')}><Settings size={15} /> Review provider settings</button></div></div>
+            )}
+            {visibleMediaJobs.length ? (
+              <div className="media-grid">
+                {visibleMediaJobs.map((job) => (
+                  <article className="media-result-card" key={job.id}>
+                    {job.status === 'completed' && job.file_url ? (
+                      job.media_type === 'image'
+                        ? <img src={job.file_url} alt={job.prompt} loading="lazy" />
+                        : <video src={job.file_url} controls preload="metadata" />
+                    ) : (
+                      <div className={`media-result-placeholder ${job.status === 'failed' ? 'media-failed' : ''}`}>
+                        {job.status === 'failed' ? <Activity size={20} /> : <LoaderCircle className="spin" size={20} />}
+                        <strong>{job.status === 'failed' ? 'Generation failed' : `Generation ${job.status}`}</strong>
+                        {job.error && <span role="alert">{job.error}</span>}
+                      </div>
+                    )}
+                    <div className="media-result-details">
+                      <p>{job.prompt}</p>
+                      <span>{job.media_type} · {new Date(job.created_at).toLocaleString()}</span>
+                      <button className="icon-button" aria-label="Delete generated media" onClick={() => void deleteMediaJob(job)}><Trash2 size={15} /></button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="media-empty">
+                <GalleryVerticalEnd size={21} />
+                <strong>{section === 'gallery' ? 'Your gallery is empty' : `No ${section === 'images' ? 'images' : 'videos'} yet`}</strong>
+                <span>Generated files will appear here when ComfyUI finishes a workflow.</span>
+              </div>
+            )}
+            <div className="honest-note"><ShieldCheck size={16} /><span>Generation runs through your configured ComfyUI server. Media files are private to your account.</span></div>
           </section>
         )}
 
@@ -472,7 +602,7 @@ function App() {
           <section className="settings-page">
             <div className="settings-intro"><span className="eyebrow">PREFERENCES</span><h1>Settings</h1><p>Manage your Bionic connection and personal workspace.</p></div>
             <div className="settings-section"><div className="settings-title"><div><h2>Bionic chat provider</h2><p>Chat requests use the Bionic-compatible endpoint configured on the backend.</p></div><span className={`status-pill ${models?.connected ? 'pill-good' : ''}`}><span className={`status-dot ${models?.connected ? 'online' : 'offline'}`} />{models?.connected ? 'CONNECTED' : 'OFFLINE'}</span></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><Activity size={18} /></div><div><strong>{models?.connected ? 'Bionic is reachable' : 'Bionic is not connected'}</strong><p>{models?.connected ? `${models.models.length} model${models.models.length === 1 ? '' : 's'} available from the configured endpoint.` : models?.message ?? 'Configure BIONIC_API_BASE_URL on the backend, then check the connection.'}</p></div></div><button className="secondary-button" onClick={() => void refreshModels().catch((error: Error) => setAppError(error.message))}><Activity size={14} /> Check connection</button></div>{models?.connected && !models.models.length && <div className="setup-tip"><strong>No models available</strong><p>Check that your Bionic deployment has at least one model enabled and that its OpenAI-compatible <code>/models</code> endpoint is enabled.</p></div>}{models?.connected && models.models.length > 0 && <div className="model-list">{models.models.map((model) => <div key={model.name}><span className="status-dot online" /><strong>{model.name}</strong><small>Available from Bionic</small></div>)}</div>}<div className="setup-tip"><strong>Configure Bionic securely</strong><p>Set <code>BIONIC_API_BASE_URL</code> and, if required, <code>BIONIC_API_KEY</code> in <code>python-backend\\.env</code>, then restart the backend. Credentials are never sent to the browser. The endpoint must support OpenAI-compatible <code>/models</code> and streaming <code>/chat/completions</code>.</p></div></div>
-            <div className="settings-section"><div className="settings-title"><div><h2>Image &amp; video providers</h2><p>These features require separately installed compatible services.</p></div></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><Image size={18} /></div><div><strong>Image generation · Not configured</strong><p>{capabilities?.images.message}</p></div></div></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><Video size={18} /></div><div><strong>Video generation · Not configured</strong><p>{capabilities?.videos.message}</p></div></div></div></div>
+            <div className="settings-section"><div className="settings-title"><div><h2>Image &amp; video providers</h2><p>Run a local ComfyUI server and configure API-format workflows in the backend environment.</p></div></div>{(['images', 'videos'] as const).map((kind) => { const capability = capabilities?.[kind]; return <div className="settings-card" key={kind}><div className="settings-card-main"><div className="settings-icon">{kind === 'images' ? <Image size={18} /> : <Video size={18} />}</div><div><strong>{kind === 'images' ? 'Image' : 'Video'} generation · {capability?.available ? 'Configured' : 'Not configured'}</strong><p>{capability?.message ?? 'Provider status is not available.'}</p></div></div><span className={`status-pill ${capability?.available ? 'pill-good' : ''}`}><span className={`status-dot ${capability?.available ? 'online' : 'offline'}`} />{capability?.available ? 'CONFIGURED' : 'SETUP NEEDED'}</span></div> })}<div className="setup-tip"><strong>ComfyUI setup</strong><p>Set <code>COMFYUI_API_BASE_URL</code>, each workflow JSON path, prompt node ID, and prompt input name in <code>python-backend\\.env</code>. Export workflows in ComfyUI API format. See the README for details; provider credentials stay on the backend.</p></div></div>
             <div className="settings-section account-section"><div className="settings-title"><div><h2>Account</h2><p>{user.is_guest ? 'Using a temporary guest session' : `Signed in as ${user.email}`}</p></div></div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><ShieldCheck size={18} /></div><div><strong>{user.is_guest ? 'Temporary private workspace' : 'Private workspace'}</strong><p>{user.is_guest ? 'Chats are isolated to this guest session and deleted when you sign out or it expires.' : 'Your conversation history is private to your account. Session cookie is HTTP-only.'}</p></div></div>{user.is_guest ? <button className="secondary-button danger-button" onClick={() => void logout()}><LogOut size={14} /> End guest session</button> : <button className="secondary-button danger-button" onClick={() => { if (window.confirm('Permanently delete your account and all conversations? This cannot be undone.')) void api('/users/me', { method: 'DELETE' }).then(() => setUser(null)).catch((error: Error) => setAppError(error.message)) }}><Trash2 size={14} /> Delete account</button>}</div><div className="settings-card"><div className="settings-card-main"><div className="settings-icon"><MoreHorizontal size={18} /></div><div><strong>Theme</strong><p>Choose a comfortable appearance for your workspace.</p></div></div><button className="secondary-button" onClick={() => setDark(!dark)}>{dark ? 'Use light theme' : 'Use dark theme'}</button></div></div>
             <div className="settings-footer">Password recovery links expire after 30 minutes. Configure SMTP_HOST and SMTP_FROM_EMAIL on the server to deliver them.</div>
           </section>

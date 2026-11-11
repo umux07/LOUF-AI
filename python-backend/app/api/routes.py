@@ -1,16 +1,17 @@
 import json
 import logging
-import smtplib
+import mimetypes
 import secrets
+import smtplib
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Annotated
 from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -19,6 +20,7 @@ from app.core.config import settings
 from app.database.session import get_db
 from app.models.entities import (
     Conversation,
+    MediaJob,
     Message,
     PasswordResetToken,
     User,
@@ -31,10 +33,20 @@ from app.schemas.api import (
     ConversationOut,
     ConversationRename,
     Credentials,
+    MediaGenerateRequest,
+    MediaJobOut,
     MessageOut,
     PasswordResetConfirm,
     PasswordResetRequest,
     UserOut,
+)
+from app.services.media_generation import (
+    MediaProviderError,
+    media_provider_configured,
+    refresh_generation,
+    remove_user_media_files,
+    resolve_stored_media,
+    submit_generation,
 )
 from app.services.security import (
     get_current_session,
@@ -299,6 +311,14 @@ def logout(request: Request, response: Response, db: Db, session: CurrentSession
     verify_csrf_cookie(request)
     user = db.get(User, session.user_id)
     if user and user.is_guest:
+        try:
+            remove_user_media_files(user.media_jobs)
+        except (MediaProviderError, OSError) as error:
+            logger.exception("Could not remove media for guest user %s.", user.id)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Generated media could not be removed.",
+            ) from error
         db.delete(user)
     else:
         db.delete(session)
@@ -317,6 +337,14 @@ def get_me(user: CurrentUser) -> User:
 @router.delete("/users/me", status_code=status.HTTP_204_NO_CONTENT)
 def delete_account(request: Request, response: Response, db: Db, user: CurrentUser) -> Response:
     verify_csrf_cookie(request)
+    try:
+        remove_user_media_files(user.media_jobs)
+    except (MediaProviderError, OSError) as error:
+        logger.exception("Could not remove media for user %s.", user.id)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Generated media could not be removed.",
+        ) from error
     db.delete(user)
     db.commit()
     response.delete_cookie("louf_session", path="/", secure=settings.cookie_secure, httponly=True)
@@ -370,22 +398,156 @@ async def list_models() -> dict[str, object]:
 
 @router.get("/capabilities")
 def capabilities() -> dict[str, object]:
+    image_ready = media_provider_configured("image")
+    video_ready = media_provider_configured("video")
     return {
         "chat": {
             "provider": "Bionic",
             "configured": bool(settings.bionic_api_base_url.strip()),
         },
         "images": {
-            "configured": False,
-            "available": False,
-            "message": "No image-generation service is configured. Configure a compatible local provider to enable this feature.",
+            "provider": "ComfyUI",
+            "configured": image_ready,
+            "available": image_ready,
+            "message": (
+                "ComfyUI image generation is configured."
+                if image_ready
+                else (
+                    "Configure the ComfyUI API URL and an API-format image workflow, "
+                    "including its prompt node."
+                )
+            ),
         },
         "videos": {
-            "configured": False,
-            "available": False,
-            "message": "No video-generation service is configured. Configure a compatible inference service to enable this feature.",
+            "provider": "ComfyUI",
+            "configured": video_ready,
+            "available": video_ready,
+            "message": (
+                "ComfyUI video generation is configured."
+                if video_ready
+                else (
+                    "Configure the ComfyUI API URL and an API-format video workflow, "
+                    "including its prompt node."
+                )
+            ),
         },
     }
+
+
+def media_job_response(job: MediaJob) -> MediaJobOut:
+    return MediaJobOut(
+        id=job.id,
+        media_type=job.media_type,
+        prompt=job.prompt,
+        status=job.status,
+        error=job.error,
+        created_at=job.created_at,
+        file_url=f"/api/v1/media/jobs/{job.id}/file" if job.status == "completed" else None,
+    )
+
+
+@router.post("/media/jobs", response_model=MediaJobOut, status_code=status.HTTP_202_ACCEPTED)
+def create_media_job(
+    payload: MediaGenerateRequest,
+    request: Request,
+    db: Db,
+    user: CurrentUser,
+) -> MediaJobOut:
+    verify_csrf_cookie(request)
+    try:
+        provider_prompt_id = submit_generation(payload.media_type, payload.prompt)
+    except MediaProviderError as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(error)) from error
+
+    job = MediaJob(
+        user_id=user.id,
+        media_type=payload.media_type,
+        prompt=payload.prompt,
+        provider_prompt_id=provider_prompt_id,
+        status="queued",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return media_job_response(job)
+
+
+@router.get("/media/jobs", response_model=list[MediaJobOut])
+def list_media_jobs(db: Db, user: CurrentUser) -> list[MediaJobOut]:
+    jobs = db.scalars(
+        select(MediaJob)
+        .where(MediaJob.user_id == user.id)
+        .order_by(MediaJob.created_at.desc())
+        .limit(50)
+    ).all()
+    return [media_job_response(job) for job in jobs]
+
+
+@router.get("/media/jobs/{job_id}", response_model=MediaJobOut)
+def get_media_job(job_id: str, db: Db, user: CurrentUser) -> MediaJobOut:
+    job = db.scalar(select(MediaJob).where(MediaJob.id == job_id, MediaJob.user_id == user.id))
+    if not job:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Media job not found.")
+    if job.status in {"queued", "processing"}:
+        try:
+            refresh_generation(job)
+        except MediaProviderError as error:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(error)) from error
+        job.updated_at = datetime.now(UTC)
+        db.commit()
+        db.refresh(job)
+    return media_job_response(job)
+
+
+@router.get("/media/jobs/{job_id}/file")
+def get_media_file(job_id: str, db: Db, user: CurrentUser) -> FileResponse:
+    job = db.scalar(
+        select(MediaJob).where(
+            MediaJob.id == job_id,
+            MediaJob.user_id == user.id,
+            MediaJob.status == "completed",
+        )
+    )
+    if not job or not job.file_path:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Generated media not found.")
+    try:
+        path = resolve_stored_media(job.file_path)
+    except MediaProviderError as error:
+        logger.exception("Stored media path validation failed for job %s.", job.id)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(error)) from error
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Generated media file is missing.")
+    return FileResponse(
+        path,
+        media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        filename=path.name,
+        content_disposition_type="inline",
+    )
+
+
+@router.delete("/media/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_media_job(
+    job_id: str,
+    request: Request,
+    db: Db,
+    user: CurrentUser,
+) -> Response:
+    verify_csrf_cookie(request)
+    job = db.scalar(select(MediaJob).where(MediaJob.id == job_id, MediaJob.user_id == user.id))
+    if not job:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Media job not found.")
+    if job.file_path:
+        try:
+            resolve_stored_media(job.file_path).unlink(missing_ok=True)
+        except (MediaProviderError, OSError) as error:
+            logger.exception("Could not remove generated media for job %s.", job.id)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Generated media could not be removed.",
+            ) from error
+    db.delete(job)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/conversations", response_model=list[ConversationOut])

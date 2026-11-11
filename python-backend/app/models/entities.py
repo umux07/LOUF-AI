@@ -33,6 +33,9 @@ class User(Base):
     password_reset_tokens: Mapped[list["PasswordResetToken"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    media_jobs: Mapped[list["MediaJob"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class UserSession(Base):
@@ -86,3 +89,23 @@ class Message(Base):
     model: Mapped[str | None] = mapped_column(String(160), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class MediaJob(Base):
+    __tablename__ = "media_jobs"
+    __table_args__ = (
+        Index("ix_media_jobs_user_created", "user_id", "created_at"),
+        Index("ix_media_jobs_provider_prompt_id", "provider_prompt_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    media_type: Mapped[str] = mapped_column(String(10))
+    prompt: Mapped[str] = mapped_column(Text)
+    provider_prompt_id: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    user: Mapped[User] = relationship(back_populates="media_jobs")

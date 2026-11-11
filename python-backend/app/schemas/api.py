@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -78,3 +79,26 @@ class ChatRequest(BaseModel):
         if not value.strip():
             raise ValueError("Message cannot be empty.")
         return value
+
+
+class MediaGenerateRequest(BaseModel):
+    media_type: Literal["image", "video"]
+    prompt: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("prompt")
+    @classmethod
+    def reject_blank_prompt(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Prompt cannot be empty.")
+        return value.strip()
+
+
+class MediaJobOut(BaseModel):
+    id: str
+    media_type: Literal["image", "video"]
+    prompt: str
+    status: Literal["queued", "processing", "completed", "failed"]
+    error: str | None
+    created_at: datetime
+    file_url: str | None
+    model_config = ConfigDict(from_attributes=True)

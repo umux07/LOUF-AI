@@ -1,6 +1,6 @@
 # LOUF AI
 
-LOUF AI is an assistant workspace with protected accounts, persistent conversations, streaming chat through a configurable Bionic-compatible API, and an honest connection status for image/video providers. It does **not** return synthetic AI or media results.
+LOUF AI is an assistant workspace with protected accounts, persistent conversations, streaming chat through a configurable Bionic-compatible API, and local ComfyUI image/video generation. It does **not** return synthetic AI or media results.
 
 ## Current implementation status
 
@@ -13,11 +13,11 @@ LOUF AI is an assistant workspace with protected accounts, persistent conversati
 | Responsive chat UI, model selector, history search, light/dark themes | Implemented |
 | Account deletion and session/conversation cascade | Implemented |
 | SQLite schema migration | Initial reversible Alembic migration included |
-| Image/video inference, generation jobs, and media gallery | Pending provider integration; UI reports unavailable rather than showing fake output |
+| ComfyUI image/video generation jobs and private media gallery | Implemented; requires configured API-format workflows and compatible installed models |
 | Email verification, admin management, usage/audit dashboard | Pending |
 | MySQL | Optional SQLAlchemy URL path; install the `mysql` extra and configure a MySQL URL |
 
-The image and video screens are explicitly not generation tools yet. A local image/video backend, job lifecycle, and media persistence must be integrated and tested before those features can be considered complete.
+Image and video generation use a local ComfyUI server. Each feature needs an API-format workflow exported from ComfyUI and a prompt node ID/input configured on the backend. Jobs are polled from the browser, and generated files are stored under `STORAGE_DIR` and served only to their owning account.
 
 Guest sessions use an isolated temporary account. Their conversations are deleted on sign-out; after expiration they are inaccessible and are purged on the next guest session start or expired-session request. Guest chats cannot be recovered or converted to a registered account.
 
@@ -91,7 +91,16 @@ Edit `python-backend\.env`:
 | `BIONIC_API_BASE_URL` | Bionic OpenAI-compatible API base URL, ending in `/v1` |
 | `BIONIC_API_KEY` | Optional bearer token; stored only in the backend environment |
 | `BIONIC_TIMEOUT_SECONDS` | Maximum inference wait |
-| `STORAGE_DIR` | Reserved for future media storage integration |
+| `STORAGE_DIR` | Private on-disk storage root for generated media |
+| `COMFYUI_API_BASE_URL` | Local ComfyUI HTTP API URL, usually `http://127.0.0.1:8188` |
+| `COMFYUI_IMAGE_WORKFLOW_PATH` | Path to an API-format ComfyUI image workflow JSON file |
+| `COMFYUI_IMAGE_PROMPT_NODE_ID` | Node ID in that workflow whose input receives the prompt |
+| `COMFYUI_IMAGE_PROMPT_INPUT` | Prompt input name on the configured image node; defaults to `text` |
+| `COMFYUI_VIDEO_WORKFLOW_PATH` | Path to an API-format ComfyUI video workflow JSON file |
+| `COMFYUI_VIDEO_PROMPT_NODE_ID` | Node ID in that workflow whose input receives the prompt |
+| `COMFYUI_VIDEO_PROMPT_INPUT` | Prompt input name on the configured video node; defaults to `text` |
+| `COMFYUI_TIMEOUT_SECONDS` | Timeout for ComfyUI API and output retrieval |
+| `COMFYUI_MAX_OUTPUT_BYTES` | Maximum size of a generated file (default 100 MiB) |
 | `FRONTEND_BASE_URL` | Frontend URL used to create password reset links |
 | `SMTP_HOST`, `SMTP_PORT` | SMTP server used for password recovery |
 | `SMTP_USERNAME`, `SMTP_PASSWORD` | Optional SMTP authentication |
@@ -101,6 +110,24 @@ Edit `python-backend\.env`:
 For MySQL, install `python -m pip install -e ".[mysql]"` from `python-backend` and set a `mysql+pymysql://...` database URL. Back up databases before schema changes; migrations are explicit and the API does not create or drop tables at startup.
 
 Password reset is available from the sign-in screen. Configure SMTP in `python-backend\.env`; reset tokens are single-use, expire after 30 minutes, and are stored only as keyed hashes. Password reset invalidates existing sessions. Without SMTP configuration, reset requests return an explicit service-unavailable error.
+
+## Local image and video generation
+
+Install and start ComfyUI separately, then install the model checkpoints and custom nodes required by your workflows. Export each workflow using ComfyUI's **Save (API Format)** option. Configure the API endpoint and both workflow entries in `python-backend\.env`; an image or video workflow can be omitted if that capability is not needed. For each workflow, set the prompt node ID and its prompt input name (commonly `text`). The backend replaces that input with the submitted prompt and sends the workflow to ComfyUI's `/prompt` API.
+
+Example:
+
+```dotenv
+COMFYUI_API_BASE_URL=http://127.0.0.1:8188
+COMFYUI_IMAGE_WORKFLOW_PATH=C:\ComfyUI\workflows\louf-image-api.json
+COMFYUI_IMAGE_PROMPT_NODE_ID=6
+COMFYUI_IMAGE_PROMPT_INPUT=text
+COMFYUI_VIDEO_WORKFLOW_PATH=C:\ComfyUI\workflows\louf-video-api.json
+COMFYUI_VIDEO_PROMPT_NODE_ID=6
+COMFYUI_VIDEO_PROMPT_INPUT=text
+```
+
+Paths are read by the backend process, so the files must be accessible to its OS account. ComfyUI workflows are user-provided; ensure each workflow writes an image (`png`, `jpg`, `webp`, or `gif`) or video (`mp4`, `webm`, `mov`, `mkv`, or `gif`) output. LOUF polls ComfyUI history, downloads the completed media into an account-scoped directory under `STORAGE_DIR`, and serves it only after checking the signed-in owner. Applying the new media-job database migration is required: run `alembic upgrade head` from `python-backend`.
 
 ## Tests and build
 

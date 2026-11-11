@@ -32,7 +32,10 @@ class CsrfMiddleware(BaseHTTPMiddleware):
 app = FastAPI(
     title="LOUF AI API",
     version="0.1.0",
-    description="Assistant API. Chat inference requires a configured Bionic-compatible endpoint.",
+    description=(
+        "Assistant API. Chat uses a configured Bionic-compatible endpoint; "
+        "image and video generation use configured local ComfyUI workflows."
+    ),
 )
 app.add_middleware(CsrfMiddleware)
 app.add_middleware(

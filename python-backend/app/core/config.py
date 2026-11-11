@@ -13,6 +13,15 @@ class Settings(BaseSettings):
     bionic_api_key: str = ""
     bionic_timeout_seconds: float = 180
     storage_dir: str = "./storage"
+    comfyui_api_base_url: str = ""
+    comfyui_image_workflow_path: str = ""
+    comfyui_image_prompt_node_id: str = ""
+    comfyui_image_prompt_input: str = "text"
+    comfyui_video_workflow_path: str = ""
+    comfyui_video_prompt_node_id: str = ""
+    comfyui_video_prompt_input: str = "text"
+    comfyui_timeout_seconds: float = 900
+    comfyui_max_output_bytes: int = 104857600
     frontend_base_url: str = "http://localhost:5173"
     smtp_host: str = ""
     smtp_port: int = 587
