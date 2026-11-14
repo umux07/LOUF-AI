@@ -11,6 +11,7 @@ LOUF AI is an assistant workspace with protected accounts, persistent conversati
 | Password reset | Implemented; requires SMTP configuration |
 | Bionic-compatible model discovery and streamed chat | Implemented; requires a configured OpenAI-compatible Bionic API endpoint |
 | Responsive chat UI, model selector, history search, light/dark themes | Implemented |
+| User-data charts | Implemented; validates bounded JSON data and renders an accessible bar chart with a data table in the browser |
 | Account deletion and session/conversation cascade | Implemented |
 | SQLite schema migration | Initial reversible Alembic migration included |
 | ComfyUI image/video generation jobs and private media gallery | Implemented; requires configured API-format workflows and compatible installed models |
@@ -135,9 +136,12 @@ Paths are read by the backend process, so the files must be accessible to its OS
 Set-Location python-backend
 ..\.venv\Scripts\python.exe -m pytest tests
 Set-Location ..\frontend
+npm.cmd run test
 npm.cmd run build
 npm.cmd run lint
 ```
+
+The Charts workspace accepts 1–12 labeled numeric values as JSON and creates a bar chart locally. It does not send chart data to an AI provider or save it beyond the current browser session.
 
 Automated tests use an isolated in-memory SQLite database. Real model tests require a reachable Bionic-compatible endpoint and a model enabled for that endpoint.
 

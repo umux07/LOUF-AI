@@ -3,10 +3,11 @@ import type { FormEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
-  Activity, ArrowUp, Check, ChevronDown, CircleHelp, Copy, GalleryVerticalEnd,
+  Activity, ArrowUp, BarChart3, Check, ChevronDown, CircleHelp, Copy, GalleryVerticalEnd,
   Image, LoaderCircle, LogOut, Menu, MessageSquarePlus, MoreHorizontal, Pencil, Plus,
   Search, Settings, ShieldCheck, Sparkles, Trash2, Video, X,
 } from 'lucide-react'
+import { ChartStudio } from './components/ChartStudio'
 import './App.css'
 
 const API = '/api/v1'
@@ -28,7 +29,7 @@ type Capabilities = {
   images: { available: boolean; message: string; provider: string }
   videos: { available: boolean; message: string; provider: string }
 }
-type Section = 'chat' | 'images' | 'videos' | 'gallery' | 'settings'
+type Section = 'chat' | 'charts' | 'images' | 'videos' | 'gallery' | 'settings'
 
 async function csrfToken() {
   const response = await fetch(`${API}/auth/csrf`, { credentials: 'include' })
@@ -451,6 +452,7 @@ function App() {
   const filteredConversations = conversations.filter((item) => item.title.toLowerCase().includes(search.toLowerCase()))
   const navigation: { id: Section; label: string; icon: typeof MessageSquarePlus }[] = [
     { id: 'chat', label: 'Chat', icon: MessageSquarePlus },
+    { id: 'charts', label: 'Charts', icon: BarChart3 },
     { id: 'images', label: 'Image studio', icon: Image },
     { id: 'videos', label: 'Video studio', icon: Video },
     { id: 'gallery', label: 'Your gallery', icon: GalleryVerticalEnd },
@@ -597,6 +599,8 @@ function App() {
             <div className="honest-note"><ShieldCheck size={16} /><span>Generation runs through your configured ComfyUI server. Media files are private to your account.</span></div>
           </section>
         )}
+
+        {section === 'charts' && <ChartStudio />}
 
         {section === 'settings' && (
           <section className="settings-page">
